@@ -1,0 +1,69 @@
+"""
+services/execution_scheduler.py
+
+Server-side scheduler for production execution.
+
+Use APScheduler for the MVP. For serious production scale, replace this with
+Celery/Redis or a cloud scheduled job calling a protected endpoint.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from database import SessionLocal
+from services.execution_service import run_daily_execution
+
+logger = logging.getLogger(__name__)
+
+_scheduler: BackgroundScheduler | None = None
+
+
+def _run_job() -> None:
+    db = SessionLocal()
+    try:
+        dry_run = os.getenv("AURORATIO_EXECUTION_DRY_RUN", "true").lower() != "false"
+        summary = run_daily_execution(db, dry_run=dry_run)
+        logger.info("Daily execution summary: %s", summary)
+    except Exception:
+        logger.exception("Daily execution job failed")
+    finally:
+        db.close()
+
+
+def start_execution_scheduler() -> None:
+    global _scheduler
+
+    if _scheduler and _scheduler.running:
+        return
+
+    enabled = os.getenv("AURORATIO_SCHEDULER_ENABLED", "false").lower() == "true"
+    if not enabled:
+        logger.info("AuroRatio scheduler disabled. Set AURORATIO_SCHEDULER_ENABLED=true to enable.")
+        return
+
+    timezone = os.getenv("AURORATIO_SCHEDULER_TIMEZONE", "Europe/Paris")
+    hour = int(os.getenv("AURORATIO_DAILY_HOUR", "17"))
+    minute = int(os.getenv("AURORATIO_DAILY_MINUTE", "5"))
+
+    _scheduler = BackgroundScheduler(timezone=timezone)
+    _scheduler.add_job(
+        _run_job,
+        CronTrigger(day_of_week="mon-fri", hour=hour, minute=minute, timezone=timezone),
+        id="auroratio_daily_execution",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    _scheduler.start()
+    logger.info("AuroRatio scheduler started: weekdays %02d:%02d %s", hour, minute, timezone)
+
+
+def stop_execution_scheduler() -> None:
+    global _scheduler
+    if _scheduler and _scheduler.running:
+        _scheduler.shutdown(wait=False)
+        logger.info("AuroRatio scheduler stopped")

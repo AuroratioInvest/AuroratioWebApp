@@ -1,0 +1,399 @@
+# """
+# services/portfolio_init_service.py
+
+# Handles 3-module portfolio initialization for new users.
+# Analyzes user's current holdings and creates appropriate module allocations.
+# """
+
+# from sqlalchemy.orm import Session
+# from models import ModulePosition, BotState
+# from datetime import datetime, timezone
+# import logging
+
+# logger = logging.getLogger(__name__)
+
+# # Metal to ETC mapping
+# METAL_TO_ETC = {
+#     "GOLD": "SGLN.L",
+#     "SILVER": "SSLN.L",
+#     "PLATINUM": "SPLT.L",
+#     "PALLADIUM": "SPDM.L",
+# }
+
+# ETC_TO_METAL = {v: k for k, v in METAL_TO_ETC.items()}
+
+
+# class PortfolioInitializationError(Exception):
+#     """Raised when portfolio cannot be automatically initialized."""
+#     pass
+
+
+# def get_portfolio_analysis(user_id, snaptrade):
+#     """
+#     Analyze user's current portfolio via SnapTrade.
+    
+#     Returns:
+#         {
+#             'total_value_chf': float,
+#             'cash_balances': {currency: amount},
+#             'metal_positions': [(symbol, shares)],
+#             'other_positions': [(symbol, shares)],
+#             'can_auto_initialize': bool,
+#             'initialization_type': str
+#         }
+#     """
+#     try:
+#         from services.portfolio_service import sync_positions_from_snaptrade
+        
+#         # This will be updated to return more detailed info
+#         # For now, we'll call SnapTrade directly
+        
+#         accounts = snaptrade.account_information.get_all_user_holdings(
+#             user_id=connection.snaptrade_user_id,
+#             user_secret=connection.snaptrade_user_secret
+#         )
+        
+#         total_value_chf = 0
+#         cash_balances = {}
+#         metal_positions = []
+#         other_positions = []
+        
+#         for account_dict in accounts.body:
+#             # Get total value
+#             account_total = account_dict.get('total_value', {})
+#             if isinstance(account_total, dict) and account_total.get('currency') == 'CHF':
+#                 total_value_chf += float(account_total.get('value', 0))
+            
+#             # Get cash balances
+#             for balance in account_dict.get('balances', []):
+#                 currency = balance.get('currency', {}).get('code')
+#                 cash = balance.get('cash', 0)
+#                 if currency and cash > 0:
+#                     cash_balances[currency] = cash_balances.get(currency, 0) + cash
+            
+#             # Categorize positions
+#             for position in account_dict.get('positions', []):
+#                 symbol_data = position.get('symbol', {})
+#                 symbol = None
+#                 if isinstance(symbol_data, dict):
+#                     inner_symbol = symbol_data.get('symbol', {})
+#                     if isinstance(inner_symbol, dict):
+#                         symbol = inner_symbol.get('symbol')
+                
+#                 units = position.get('units', 0)
+                
+#                 if not symbol or units == 0:
+#                     continue
+                
+#                 if symbol in ETC_TO_METAL:
+#                     metal_positions.append((symbol, units))
+#                 else:
+#                     other_positions.append((symbol, units))
+        
+#         # Determine if can auto-initialize
+#         can_auto_initialize = False
+#         init_type = None
+        
+#         if other_positions:
+#             # Has non-metal securities - cannot auto-initialize
+#             can_auto_initialize = False
+#             init_type = "REJECT_NON_METAL"
+#         elif not metal_positions and cash_balances:
+#             # Pure cash - can initialize
+#             can_auto_initialize = True
+#             init_type = "FROM_CASH"
+#         elif metal_positions and not other_positions:
+#             # Only metal ETCs - check if all gold and divisible by 3
+#             if len(metal_positions) == 1 and metal_positions[0][0] == 'SGLN.L':
+#                 total_gold = metal_positions[0][1]
+#                 if total_gold % 3 == 0:
+#                     can_auto_initialize = True
+#                     init_type = "FROM_GOLD"
+#                 else:
+#                     can_auto_initialize = False
+#                     init_type = "GOLD_NOT_DIVISIBLE"
+#             else:
+#                 # Mixed metals
+#                 can_auto_initialize = False
+#                 init_type = "MIXED_METALS"
+#         elif total_value_chf < 1000:
+#             can_auto_initialize = False
+#             init_type = "BALANCE_TOO_LOW"
+#         else:
+#             can_auto_initialize = False
+#             init_type = "UNKNOWN"
+        
+#         return {
+#             'total_value_chf': total_value_chf,
+#             'cash_balances': cash_balances,
+#             'metal_positions': metal_positions,
+#             'other_positions': other_positions,
+#             'can_auto_initialize': can_auto_initialize,
+#             'initialization_type': init_type
+#         }
+        
+#     except Exception as e:
+#         logger.error(f"Failed to analyze portfolio: {e}")
+#         raise
+
+
+# def initialize_portfolio(user_id, db: Session, snaptrade, broker=None):
+#     """
+#     Initialize 3-module portfolio structure for a user.
+    
+#     Args:
+#         user_id: User ID
+#         db: Database session
+#         snaptrade: SnapTrade client
+#         broker: IB Gateway broker client (optional, only needed for FROM_CASH)
+    
+#     Returns:
+#         dict with initialization results
+        
+#     Raises:
+#         PortfolioInitializationError if portfolio cannot be initialized
+#     """
+#     logger.info(f"Initializing portfolio for user {user_id}")
+    
+#     # Check if already initialized
+#     existing = db.query(ModulePosition).filter(
+#         ModulePosition.user_id == user_id
+#     ).first()
+    
+#     if existing:
+#         raise PortfolioInitializationError("Portfolio already initialized")
+    
+#     # Analyze current portfolio
+#     analysis = get_portfolio_analysis(user_id, snaptrade)
+    
+#     if not analysis['can_auto_initialize']:
+#         error_messages = {
+#             'REJECT_NON_METAL': (
+#                 "Your account contains non-metal securities (stocks, bonds, etc.). "
+#                 "Please liquidate these positions to cash or metal ETCs before connecting AuroRatio."
+#             ),
+#             'MIXED_METALS': (
+#                 "Your account contains mixed metal positions. "
+#                 "Please contact support for manual portfolio initialization, "
+#                 "or liquidate to cash or pure gold (SGLN.L) before connecting."
+#             ),
+#             'GOLD_NOT_DIVISIBLE': (
+#                 f"You have {analysis['metal_positions'][0][1]} SGLN shares, which cannot be split evenly into 3 modules. "
+#                 f"Please adjust to a multiple of 3 shares or contact support for manual setup."
+#             ),
+#             'BALANCE_TOO_LOW': (
+#                 f"Account balance (CHF {analysis['total_value_chf']:.2f}) is too low. "
+#                 "Minimum CHF 1,000 required."
+#             ),
+#         }
+        
+#         error_msg = error_messages.get(
+#             analysis['initialization_type'],
+#             "Portfolio cannot be automatically initialized. Please contact support."
+#         )
+        
+#         raise PortfolioInitializationError(error_msg)
+    
+#     # Route to appropriate initialization method
+#     if analysis['initialization_type'] == 'FROM_CASH':
+#         if not broker:
+#             raise ValueError("Broker client required for FROM_CASH initialization")
+#         return _initialize_from_cash(user_id, analysis['total_value_chf'], db, broker)
+    
+#     elif analysis['initialization_type'] == 'FROM_GOLD':
+#         total_gold_shares = analysis['metal_positions'][0][1]
+#         return _initialize_from_gold(user_id, total_gold_shares, db)
+    
+#     else:
+#         raise PortfolioInitializationError("Unknown initialization type")
+
+
+# def _initialize_from_cash(user_id, total_value_chf, db: Session, broker):
+#     """
+#     Initialize from pure cash by buying Gold for all 3 modules.
+    
+#     Strategy:
+#     1. Calculate target value per module (total / 3)
+#     2. Buy Gold ETCs for each module via IB Gateway
+#     3. Record allocations in database
+#     """
+#     logger.info(f"Initializing from cash: CHF {total_value_chf:.2f}")
+    
+#     target_per_module_chf = total_value_chf / 3
+    
+#     # Get current Gold price
+#     # TODO: Implement get_current_price
+#     # For now, use placeholder
+#     gold_price_gbp = 22.50  # Example: £22.50 per share
+#     gbp_to_chf = 1.06
+    
+#     # Calculate shares to buy per module
+#     target_shares_per_module = int(target_per_module_chf / (gold_price_gbp * gbp_to_chf))
+    
+#     logger.info(f"Target per module: CHF {target_per_module_chf:.2f} = ~{target_shares_per_module} SGLN shares")
+    
+#     # Connect to IB Gateway and execute trades
+#     broker.connect()
+    
+#     try:
+#         # Buy Gold for each module
+#         for idx, module_name in enumerate(["module1", "module2", "module3"], 1):
+#             logger.info(f"Buying Gold for {module_name}...")
+            
+#             order_id = broker.place_order("GOLD", "BUY", target_shares_per_module)
+            
+#             # Wait for order confirmation
+#             status = broker.wait_for_order_fill(order_id, timeout=120)
+            
+#             if status != "FILLED":
+#                 # Rollback if any module fails
+#                 logger.error(f"Failed to initialize {module_name}: Order {order_id} status={status}")
+                
+#                 # If this isn't the first module, we have a problem - already bought for previous modules
+#                 if idx > 1:
+#                     # CRITICAL: Partial initialization!
+#                     # TODO: Send email alert
+#                     raise PortfolioInitializationError(
+#                         f"CRITICAL: Partial initialization. Modules 1-{idx-1} bought Gold, "
+#                         f"but {module_name} failed. Manual intervention required."
+#                     )
+#                 else:
+#                     raise PortfolioInitializationError(f"Failed to buy Gold for {module_name}")
+            
+#             # Record in database
+#             module_pos = ModulePosition(
+#                 user_id=user_id,
+#                 module_name=module_name,
+#                 metal="GOLD",
+#                 etf_symbol="SGLN.L",
+#                 target_shares=target_shares_per_module
+#             )
+#             db.add(module_pos)
+            
+#             logger.info(f"✅ {module_name} initialized: {target_shares_per_module} SGLN shares")
+        
+#         # Initialize bot state
+#         bot_state = db.query(BotState).first()
+#         if not bot_state:
+#             bot_state = BotState(
+#                 m1_position="GOLD",
+#                 m2_position="GOLD",
+#                 m3_position="GOLD",
+#                 m1_signal_days=0,
+#                 m2_signal_days=0,
+#                 m3_signal_days=0
+#             )
+#             db.add(bot_state)
+#         else:
+#             bot_state.m1_position = "GOLD"
+#             bot_state.m2_position = "GOLD"
+#             bot_state.m3_position = "GOLD"
+#             bot_state.m1_signal_days = 0
+#             bot_state.m2_signal_days = 0
+#             bot_state.m3_signal_days = 0
+        
+#         db.commit()
+        
+#         logger.info("✅ Portfolio initialization complete")
+        
+#         return {
+#             "status": "initialized",
+#             "method": "from_cash",
+#             "modules": {
+#                 "module1": {"metal": "GOLD", "shares": target_shares_per_module},
+#                 "module2": {"metal": "GOLD", "shares": target_shares_per_module},
+#                 "module3": {"metal": "GOLD", "shares": target_shares_per_module},
+#             }
+#         }
+        
+#     finally:
+#         broker.disconnect()
+
+
+# def _initialize_from_gold(user_id, total_gold_shares, db: Session):
+#     """
+#     Initialize from existing Gold holdings by splitting shares equally.
+    
+#     No trades needed - just record the allocation in database.
+#     """
+#     logger.info(f"Initializing from existing Gold: {total_gold_shares} SGLN shares")
+    
+#     shares_per_module = total_gold_shares // 3
+    
+#     # Create module positions (no trades needed)
+#     for module_name in ["module1", "module2", "module3"]:
+#         module_pos = ModulePosition(
+#             user_id=user_id,
+#             module_name=module_name,
+#             metal="GOLD",
+#             etf_symbol="SGLN.L",
+#             target_shares=shares_per_module
+#         )
+#         db.add(module_pos)
+        
+#         logger.info(f"✅ {module_name} allocated: {shares_per_module} SGLN shares")
+    
+#     # Initialize bot state
+#     bot_state = db.query(BotState).first()
+#     if not bot_state:
+#         bot_state = BotState(
+#             m1_position="GOLD",
+#             m2_position="GOLD",
+#             m3_position="GOLD",
+#             m1_signal_days=0,
+#             m2_signal_days=0,
+#             m3_signal_days=0
+#         )
+#         db.add(bot_state)
+#     else:
+#         bot_state.m1_position = "GOLD"
+#         bot_state.m2_position = "GOLD"
+#         bot_state.m3_position = "GOLD"
+#         bot_state.m1_signal_days = 0
+#         bot_state.m2_signal_days = 0
+#         bot_state.m3_signal_days = 0
+    
+#     db.commit()
+    
+#     logger.info("✅ Portfolio initialization complete")
+    
+#     return {
+#         "status": "initialized",
+#         "method": "from_gold",
+#         "modules": {
+#             "module1": {"metal": "GOLD", "shares": shares_per_module},
+#             "module2": {"metal": "GOLD", "shares": shares_per_module},
+#             "module3": {"metal": "GOLD", "shares": shares_per_module},
+#         }
+#     }
+
+
+# def get_initialization_status(user_id, db: Session):
+#     """
+#     Check if user's portfolio is initialized.
+    
+#     Returns:
+#         {
+#             'initialized': bool,
+#             'modules': [...] if initialized, else None
+#         }
+#     """
+#     modules = db.query(ModulePosition).filter(
+#         ModulePosition.user_id == user_id
+#     ).all()
+    
+#     if not modules or len(modules) != 3:
+#         return {'initialized': False, 'modules': None}
+    
+#     return {
+#         'initialized': True,
+#         'modules': [
+#             {
+#                 'name': m.module_name,
+#                 'metal': m.metal,
+#                 'shares': m.target_shares,
+#                 'etf_symbol': m.etf_symbol
+#             }
+#             for m in modules
+#         ]
+#     }

@@ -1,0 +1,287 @@
+"""
+services/execution_service.py
+
+Production execution loop.
+
+Responsibilities:
+- Iterate over active subscribed users.
+- Sync portfolio.
+- Compute per-user signals.
+- Execute through SnapTrade, not local IB Gateway.
+- Persist execution attempts and failure state.
+- Prevent repeated emails by pausing failed modules until manual review.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import logging
+import os
+
+from sqlalchemy.orm import Session
+from snaptrade_client import SnapTrade
+
+from models import (
+    BrokerConnection,
+    ConnectionStatus,
+    ExecutionLog,
+    ExecutionStatus,
+    ModuleStatus,
+    Subscription,
+    SubscriptionStatus,
+    TradeLog,
+    TradeStatus,
+    User,
+)
+from services.portfolio_service import sync_positions_from_snaptrade
+from services.strategy_service import compute_user_signals, ModuleSignal
+from services.snaptrade_execution_service import SnapTradeExecutionService
+from services.user_bot_state_service import (
+    alert_already_sent,
+    get_or_create_user_bot_state,
+    increment_module_retry,
+    mark_alert_sent,
+    reset_module_failure,
+    set_module_position,
+    set_module_status,
+)
+from services.notification_service import send_admin_alert
+
+logger = logging.getLogger(__name__)
+
+snaptrade = SnapTrade(
+    consumer_key=os.getenv("SNAPTRADE_CONSUMER_KEY"),
+    client_id=os.getenv("SNAPTRADE_CLIENT_ID"),
+)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def get_active_trading_users(db: Session) -> list[User]:
+    return (
+        db.query(User)
+        .join(Subscription, Subscription.user_id == User.id)
+        .filter(User.is_active == True)
+        .filter(Subscription.status == SubscriptionStatus.active)
+        .all()
+    )
+
+
+def get_active_connection(db: Session, user_id: str) -> BrokerConnection | None:
+    return (
+        db.query(BrokerConnection)
+        .filter(BrokerConnection.user_id == user_id)
+        .filter(BrokerConnection.is_active == True)
+        .order_by(BrokerConnection.connected_at.desc())
+        .first()
+    )
+
+
+def create_execution_log(
+    db: Session,
+    *,
+    user_id: str,
+    module_name: str,
+    signal: ModuleSignal,
+) -> ExecutionLog:
+    log = ExecutionLog(
+        user_id=user_id,
+        module_name=module_name,
+        from_metal=signal.from_metal,
+        to_metal=signal.to_metal,
+        ratio_col=signal.ratio_col,
+        ratio_value=signal.ratio_value,
+        status=ExecutionStatus.pending,
+        created_at=utc_now(),
+    )
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+    return log
+
+
+def mark_execution_failed(db: Session, log: ExecutionLog, reason: str) -> None:
+    log.status = ExecutionStatus.failed
+    log.error_message = reason
+    log.finished_at = utc_now()
+    db.commit()
+
+
+def mark_execution_success(db: Session, log: ExecutionLog, order_id: str | None = None) -> None:
+    log.status = ExecutionStatus.success
+    log.order_id = order_id
+    log.finished_at = utc_now()
+    db.commit()
+
+
+def estimate_units_from_portfolio(
+    *,
+    portfolio: dict,
+    target_chf: float,
+    module_count: int = 3,
+) -> int:
+    """
+    Placeholder quantity sizing.
+
+    In production, replace this with SnapTrade quotes for the exact target symbol.
+    For now, this function intentionally returns 0 to prevent accidental live orders
+    until quote-based sizing is implemented.
+    """
+    return 0
+
+
+def execute_signal_for_user(
+    db: Session,
+    *,
+    user: User,
+    connection: BrokerConnection,
+    signal: ModuleSignal,
+    portfolio: dict,
+    dry_run: bool = True,
+) -> bool:
+    state = get_or_create_user_bot_state(db, user.id)
+    execution_log = create_execution_log(db, user_id=user.id, module_name=signal.module_name, signal=signal)
+
+    try:
+        total_chf = float(portfolio.get("total_chf") or 0)
+        if total_chf <= 0:
+            raise RuntimeError("Portfolio total is zero; refusing to trade")
+
+        target_chf = total_chf / 3
+        units = estimate_units_from_portfolio(portfolio=portfolio, target_chf=target_chf)
+
+        execution_log.target_value_chf = target_chf
+        execution_log.units = units
+        db.commit()
+
+        if units <= 0:
+            raise RuntimeError(
+                "Quote-based order sizing is not implemented yet. "
+                "Execution blocked intentionally to avoid unsafe live orders."
+            )
+
+        if dry_run:
+            execution_log.status = ExecutionStatus.skipped
+            execution_log.error_message = "Dry run: order not submitted"
+            execution_log.finished_at = utc_now()
+            db.commit()
+            return True
+
+        executor = SnapTradeExecutionService(snaptrade)
+        result = executor.place_equity_order_checked(
+            user_id=connection.snaptrade_user_id,
+            user_secret=connection.snaptrade_user_secret,
+            account_id=connection.snaptrade_account_id,
+            metal=signal.to_metal,
+            action="BUY",
+            units=units,
+            order_type="Market",
+        )
+
+        if not result.ok:
+            raise RuntimeError(result.error or "SnapTrade order failed")
+
+        mark_execution_success(db, execution_log, order_id=result.order_id)
+
+        trade_log = TradeLog(
+            user_id=user.id,
+            from_metal=signal.from_metal,
+            to_metal=signal.to_metal,
+            ratio_col=signal.ratio_col,
+            ratio_value=signal.ratio_value,
+            quantity=units,
+            status=TradeStatus.success,
+        )
+        db.add(trade_log)
+
+        set_module_position(state, signal.module_name, signal.to_metal)
+        reset_module_failure(state, signal.module_name)
+        db.commit()
+        return True
+
+    except Exception as exc:
+        reason = str(exc)
+        logger.exception("Execution failed for user=%s module=%s", user.id, signal.module_name)
+        mark_execution_failed(db, execution_log, reason)
+
+        retry_count = increment_module_retry(state, signal.module_name)
+        set_module_status(state, signal.module_name, ModuleStatus.cash_manual_review, reason)
+
+        trade_log = TradeLog(
+            user_id=user.id,
+            from_metal=signal.from_metal,
+            to_metal=signal.to_metal,
+            ratio_col=signal.ratio_col,
+            ratio_value=signal.ratio_value,
+            quantity=0,
+            status=TradeStatus.failed,
+            error_message=reason,
+        )
+        db.add(trade_log)
+
+        if not alert_already_sent(state, signal.module_name):
+            send_admin_alert(
+                subject=f"AuroRatio — {signal.module_name} requires manual review",
+                body=(
+                    f"User: {user.email} ({user.id})\n"
+                    f"Module: {signal.module_name}\n"
+                    f"Signal: {signal.from_metal} → {signal.to_metal}\n"
+                    f"Error: {reason}\n"
+                    f"Retry count: {retry_count}\n\n"
+                    "The module has been moved to CASH_MANUAL_REVIEW and will not trade again until reset."
+                ),
+            )
+            mark_alert_sent(state, signal.module_name)
+
+        db.commit()
+        return False
+
+
+def run_daily_execution(db: Session, *, dry_run: bool = True) -> dict:
+    """
+    Main production worker entry point.
+
+    Start with dry_run=True. Turn dry_run=False only after quote-based sizing and
+    SnapTrade order submission are verified in paper/sandbox mode.
+    """
+    started_at = utc_now()
+    users = get_active_trading_users(db)
+
+    summary = {
+        "started_at": started_at.isoformat(),
+        "dry_run": dry_run,
+        "users_checked": len(users),
+        "signals": 0,
+        "executed": 0,
+        "failed": 0,
+        "skipped": 0,
+    }
+
+    for user in users:
+        connection = get_active_connection(db, user.id)
+        if not connection:
+            summary["skipped"] += 1
+            continue
+
+        portfolio = sync_positions_from_snaptrade(db, user.id, snaptrade)
+        signals = compute_user_signals(db, user.id)
+        summary["signals"] += len(signals)
+
+        for signal in signals:
+            ok = execute_signal_for_user(
+                db,
+                user=user,
+                connection=connection,
+                signal=signal,
+                portfolio=portfolio,
+                dry_run=dry_run,
+            )
+            if ok:
+                summary["executed"] += 1
+            else:
+                summary["failed"] += 1
+
+    summary["finished_at"] = utc_now().isoformat()
+    return summary

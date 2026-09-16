@@ -1,0 +1,117 @@
+"""
+services/strategy_service.py
+
+Per-user signal calculation.
+
+This intentionally does NOT place orders. It only decides whether a module should
+switch metals based on latest ratios and per-user hysteresis counters.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from sqlalchemy.orm import Session
+
+from models import UserBotState, ModuleStatus
+from ratios import get_latest_ratios
+from services.user_bot_state_service import get_or_create_user_bot_state, get_module_status
+
+
+@dataclass
+class ModuleSignal:
+    module_name: str
+    from_metal: str
+    to_metal: str
+    ratio_col: str
+    ratio_value: float
+    reason: str
+
+
+BUY_THRESHOLDS = {
+    "module1": {"ratio_col": "AU_AG", "to_metal": "SILVER", "counter_attr": "m1_silver_days", "buy_at_or_above": 80.0},
+    "module2": {"ratio_col": "AU_PT", "to_metal": "PLATINUM", "counter_attr": "m2_platinum_days", "buy_at_or_above": 2.0},
+    "module3": {"ratio_col": "AU_PD", "to_metal": "PALLADIUM", "counter_attr": "m3_palladium_days", "buy_at_or_above": 4.0},
+}
+
+SELL_THRESHOLDS = {
+    "module1": {"ratio_col": "AU_AG", "to_metal": "GOLD", "counter_attr": "m1_silver_days", "sell_at_or_below": 40.0},
+    "module2": {"ratio_col": "AU_PT", "to_metal": "GOLD", "counter_attr": "m2_platinum_days", "sell_at_or_below": 0.45},
+    "module3": {"ratio_col": "AU_PD", "to_metal": "GOLD", "counter_attr": "m3_palladium_days", "sell_at_or_below": 0.9},
+}
+
+HYSTERESIS_DAYS = 2
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _module_position(state: UserBotState, module_name: str) -> str:
+    if module_name == "module1":
+        return state.m1_position
+    if module_name == "module2":
+        return state.m2_position
+    if module_name == "module3":
+        return state.m3_position
+    raise ValueError(f"Unknown module: {module_name}")
+
+
+def compute_user_signals(db: Session, user_id: str) -> list[ModuleSignal]:
+    state = get_or_create_user_bot_state(db, user_id)
+    ratios = get_latest_ratios()
+    signals: list[ModuleSignal] = []
+
+    if not state.trading_enabled:
+        return signals
+
+    for module_name, buy_rule in BUY_THRESHOLDS.items():
+        status = get_module_status(state, module_name)
+        if status != ModuleStatus.ok:
+            # Manual-review / paused modules must not trade again automatically.
+            continue
+
+        position = _module_position(state, module_name)
+        ratio_value = float(ratios[buy_rule["ratio_col"]])
+        counter_attr = buy_rule["counter_attr"]
+
+        if position == "GOLD":
+            if ratio_value >= buy_rule["buy_at_or_above"]:
+                setattr(state, counter_attr, getattr(state, counter_attr) + 1)
+            else:
+                setattr(state, counter_attr, 0)
+
+            if getattr(state, counter_attr) >= HYSTERESIS_DAYS:
+                signals.append(
+                    ModuleSignal(
+                        module_name=module_name,
+                        from_metal="GOLD",
+                        to_metal=buy_rule["to_metal"],
+                        ratio_col=buy_rule["ratio_col"],
+                        ratio_value=ratio_value,
+                        reason=f"{buy_rule['ratio_col']} buy threshold confirmed",
+                    )
+                )
+        else:
+            sell_rule = SELL_THRESHOLDS[module_name]
+            if ratio_value <= sell_rule["sell_at_or_below"]:
+                # Use same counter to confirm exit. Keeps model simple for MVP.
+                setattr(state, counter_attr, getattr(state, counter_attr) + 1)
+            else:
+                setattr(state, counter_attr, 0)
+
+            if getattr(state, counter_attr) >= HYSTERESIS_DAYS:
+                signals.append(
+                    ModuleSignal(
+                        module_name=module_name,
+                        from_metal=position,
+                        to_metal="GOLD",
+                        ratio_col=sell_rule["ratio_col"],
+                        ratio_value=ratio_value,
+                        reason=f"{sell_rule['ratio_col']} sell threshold confirmed",
+                    )
+                )
+
+    state.last_updated = utc_now()
+    db.commit()
+    return signals

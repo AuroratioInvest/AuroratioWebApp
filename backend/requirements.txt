@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+alembic
+psycopg2-binary
+python-dotenv
+python-jose[cryptography]
+passlib[bcrypt]
+bcrypt==4.3.0
+httpx
+stripe
+snaptrade-python-sdk
+typing_extensions>=4.14.1
+slowapi
+pydantic[email]
+apscheduler
+pandas

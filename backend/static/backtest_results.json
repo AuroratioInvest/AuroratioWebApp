@@ -1,0 +1,32 @@
+{
+  "finalValueCHF": 14912254.21571844,
+  "initialValueCHF": 300000.0,
+  "modules": {
+    "goldSilver": {
+      "name": "Gold ↔ Silver",
+      "finalValue": 4502687.374867869,
+      "cagr": 15.713024972500467,
+      "ounceMultiplier": 4.9120225907649475,
+      "switches": 3
+    },
+    "goldPlatinum": {
+      "name": "Gold ↔ Platinum",
+      "finalValue": 1485778.2946352428,
+      "cagr": 10.898152079161827,
+      "ounceMultiplier": 1.6208490486929923,
+      "switches": 1
+    },
+    "goldPalladium": {
+      "name": "Gold ↔ Palladium",
+      "finalValue": 8923788.54621533,
+      "cagr": 18.787315126305202,
+      "ounceMultiplier": 9.735042050416723,
+      "switches": 2
+    }
+  },
+  "totalSwitches": 6,
+  "timeframe": {
+    "start": "2000",
+    "end": "2025"
+  }
+}

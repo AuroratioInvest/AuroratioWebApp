@@ -1,0 +1,7 @@
+yfinance==0.2.61
+pandas
+matplotlib
+pyyaml
+schedule
+ib_insync
+python-dotenv

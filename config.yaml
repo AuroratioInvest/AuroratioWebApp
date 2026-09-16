@@ -1,0 +1,98 @@
+# ============================================================
+# AURORATIO — CONFIGURATION FILE
+# This is the single source of truth for all settings.
+# Every other module reads from this file.
+# Nothing is hardcoded in the Python scripts.
+# ============================================================
+
+broker:
+  # The address of IB Gateway running on your local machine.
+  # 127.0.0.1 means "this computer" — Gateway must be open and running.
+  host: "127.0.0.1"
+
+  # The port IB Gateway listens on.
+  # 4002 = Paper Trading (fake money, for testing)
+  # 4001 = Live Trading (real money — do NOT use until fully validated)
+  port: 4002
+
+  # A unique ID for this connection.
+  # If you run multiple bots simultaneously, each needs a different client_id.
+  client_id: 1
+
+security_limits:
+  # Maximum allowed price slippage before rejecting an order.
+  # Slippage = difference between expected price and actual execution price.
+  # If the spread is wider than 0.5%, the order is cancelled.
+  # This protects against bad fills on illiquid markets (Platinum, Palladium).
+  max_slippage_percent: 0.5
+
+  # Number of consecutive days a signal must be active before we act on it.
+  # This is the hysteresis mechanism — prevents reacting to a single spike.
+  # Example: if AU/AG hits 80 on Monday but drops back on Tuesday, nothing happens.
+  # It must stay above 80 for 2 consecutive days before we switch.
+  trade_delay_days: 2
+
+  # Percentage of cash to keep in reserve when buying.
+  # We never invest 100% — we keep 0.5% back to cover broker commissions.
+  # Example: if we have $100,000, we invest $99,500 and keep $500 for fees.
+  fee_reserve_percent: 0.5
+
+ratios:
+  # Gold/Silver ratio thresholds.
+  # buy: switch from Gold to Silver when ratio reaches or exceeds this value.
+  #      A ratio of 80 means 1 oz of Gold buys 80 oz of Silver — Silver is cheap.
+  # sell: switch back to Gold when ratio drops to or below this value.
+  #       A ratio of 40 means Silver has become expensive relative to Gold.
+  silver:
+    buy: 80.0
+    sell: 40.0
+
+  # Gold/Platinum ratio thresholds.
+  # buy: switch to Platinum when Gold costs 2x more than Platinum per ounce.
+  # sell: switch back to Gold when Platinum becomes nearly as expensive as Gold (ratio ≤ 0.45).
+  platinum:
+    buy: 2.0
+    sell: 0.45
+
+  # Gold/Palladium ratio thresholds.
+  # buy: switch to Palladium when Gold costs 4x more per ounce.
+  # sell: switch back when Palladium price recovers (ratio ≤ 0.9).
+  palladium:
+    buy: 4.0
+    sell: 0.9
+
+etfs:
+  # The European ETCs (Exchange Traded Commodities) used for live trading.
+  # These are iShares Physical Metal ETCs listed on the London Stock Exchange in GBP.
+  # They are MiFID II compliant — accessible to French retail investors via IB.
+  # Note: the actual IB contract lookup uses conIds in broker.py, not these ticker names.
+  gold: "SGLN"
+  silver: "SSLN"
+  platinum: "SPLT"
+  palladium: "SPDM"
+
+backtest:
+  # Historical data range for the 25-year simulation.
+  start_date: "2000-01-01"
+  # end_date is exclusive in yfinance — set to day AFTER the desired last date.
+  # To include 2025-12-31, we set end_date to 2026-01-01.
+  end_date: "2026-01-01"
+  
+  # Starting portfolio value in CHF for both portfolios being compared.
+  initial_capital: 100000
+
+  # Flat transaction cost applied to every switch, expressed as a percentage.
+  # 0.20% covers estimated broker commissions + ETF spread.
+  # Applied to the portfolio value at the moment of each switch.
+  transaction_cost_percent: 0.20
+
+alerts:
+  # Email address that sends the alert (must be a Gmail account).
+  # Requires a Gmail App Password.
+  # Generate one at: myaccount.google.com → Security →
+  # 2-Step Verification → App passwords
+  email_from: "joe.g.chamoun@gmail.com"
+
+  # Email address (or SMS gateway) that receives the alert.
+  # Can be the same as email_from for simplicity.
+  email_to: "joe.g.chamoun@gmail.com"

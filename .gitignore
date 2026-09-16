@@ -1,0 +1,48 @@
+# ── Secrets ───────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# ── Database ──────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+auroratio.db
+backend/auroratio.db
+
+# ── Bot data (large, regeneratable) ───────────────────────
+/data/
+
+# ── Bot state (machine-specific) ──────────────────────────
+state.json
+trading_history.log
+
+# ── Cache ─────────────────────────────────────────────────
+.yf_cache/
+
+# ── OS ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Notes (keep requirements.txt, ignore personal notes) ──
+notes*.txt
+*_notes.txt
+TODO.txt
+
+# ── Backend ──────────────────────────────────────────────
+backend/.env
+backend/.env.local
+
+# ── Frontend ──────────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
